@@ -1,4 +1,11 @@
 {
+  "name": "geo-grid-places-search",
+  "version": "2.0.0",
+  "description": "Grid-based Google Places scraper + enrichment pipeline + website preview dashboard",
+  "scripts": {
+    "scrape": "npx ts-node main.ts",
+    "enrich": "npx ts-node enrich.ts"
+  },
   "devDependencies": {
     "@types/node": "^25.0.3",
     "ts-node": "^10.9.2",

@@ -157,7 +157,7 @@ async function run(
   testLimit?: number
 ) {
   console.log(`📍 Geocoding ${city}`);
-  console.log(`🏷️ Types: ${types.join(", ")}`);
+  console.log(`🏷️  Types: ${types.join(", ")}`);
 
   const bounds = await geocodeCity(city);
   const fullGrid = generateGrid(bounds.southwest, bounds.northeast);

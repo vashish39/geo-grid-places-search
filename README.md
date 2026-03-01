@@ -1,151 +1,131 @@
-# 🌍 Geo Grid Places Search
+# 🌍 Geo Grid Places Search + Enrichment Pipeline
 
-A **grid-based Google Places scraper** that scans an entire city using a geographic grid and exports business data to CSV.
+A two-stage Google Places pipeline:
 
-This version is intentionally **simple and stable**, based on a working Google Places Nearby Search setup.
-
----
-
-## ✨ Features
-
-- Full city coverage using grid scanning
-- Supports **restaurant / cafe filtering**
-- Custom business types via CLI
-- Built-in **test mode** to limit grid points
-- Automatic de-duplication by place ID
-- CSV export
-- No pagination / nextPageToken (by design)
+1. **`main.ts`** — Grid-scrapes a city and exports a lightweight CSV (existing)
+2. **`enrich.ts`** — Filters the CSV, then fetches full details per business (new)
+3. **`dashboard.html`** — Visual browser for enriched data; prep for website generation (new)
 
 ---
 
 ## 📦 Requirements
 
-- Node.js **18+** (for native `fetch`)
-- npm
-- Google Cloud project with:
-  - **Geocoding API**
-  - **Places API (New)** enabled
+- Node.js **18+**
+- Google Cloud project with **Geocoding API** + **Places API (New)** enabled
 
 ---
 
 ## 🔑 Setup
 
-### 1️⃣ Clone the repo
-
-```bash
-git clone git@github.com:vashish39/geo-grid-places-search.git
-cd geo-grid-places-search
-```
-
----
-
-### 2️⃣ Install dependencies
-
 ```bash
 npm install
+export GOOGLE_API_KEY=your_key_here
 ```
 
 ---
 
-### 3️⃣ Set Google API Key (IMPORTANT)
-
-#### Git Bash / macOS / Linux
-```bash
-export GOOGLE_API_KEY=your_google_api_key
-```
-
-#### Windows PowerShell
-```powershell
-$env:GOOGLE_API_KEY="your_google_api_key"
-```
-
-> 🔒 Never hardcode API keys.  
-> `.env` files are ignored by git.
-
----
-
-## 🚀 Usage
-
-### Basic usage (default: restaurant + cafe)
+## 🚀 Step 1 — Scrape a city → CSV
 
 ```bash
-npx ts-node main.ts "Mumbai"
+# Default types (restaurant + cafe)
+npx ts-node main.ts "Austin"
+
+# Custom types
+npx ts-node main.ts "Austin" --types=restaurant,cafe,gym,beauty_salon
+
+# Test with 3 grid points first
+npx ts-node main.ts "Austin" --test=3
 ```
+
+Output: `places_Austin.csv`
+
+CSV columns: `id, name, rating, userRatingCount, websiteUri, formattedAddress, latitude, longitude`
 
 ---
 
-### Specify business types
+## 🔬 Step 2 — Enrich filtered businesses → JSON
+
+Takes the CSV, filters to leads with no website + sufficient reviews + good rating, then fetches full Google Places details for each.
 
 ```bash
-npx ts-node main.ts "Mumbai" --types=restaurant,cafe
+# Default filters: no website, >60 reviews, >3.7 rating
+npx ts-node enrich.ts places_Austin.csv
+
+# Custom filters
+npx ts-node enrich.ts places_Austin.csv --min-reviews=100 --min-rating=4.0
+
+# Test with 5 businesses
+npx ts-node enrich.ts places_Austin.csv --limit=5
+
+# Custom output path
+npx ts-node enrich.ts places_Austin.csv --output=leads_Austin.json
+
+# All options
+npx ts-node enrich.ts places_Austin.csv \
+  --min-reviews=60 \
+  --min-rating=3.7 \
+  --photos=8 \
+  --limit=10 \
+  --output=enriched_Austin.json
 ```
 
-```bash
-npx ts-node main.ts "Bangalore" --types=gym,spa,beauty_salon
+Output: `enriched_Austin.json`
+
+### What gets fetched per business
+
+| Field | Source |
+|-------|--------|
+| Name, address, phone | Places API (New) |
+| Rating + review count | Places API (New) |
+| Opening hours (all 7 days) | Places API (New) |
+| Business type + price level | Places API (New) |
+| Editorial + AI summary | Places API (New) |
+| Up to 8 direct photo URLs | Places Photos API |
+| Up to 10 customer reviews | Places API (New) |
+| Amenities (dine-in, delivery, etc.) | Places API (New) |
+| Google Maps link | Places API (New) |
+| Yelp / Instagram / Facebook guesses | Derived |
+
+---
+
+## 📊 Step 3 — Browse in dashboard
+
+Open `dashboard.html` in any browser, then drag & drop your `enriched_*.json` file onto it.
+
+Features:
+- Filterable list with thumbnails, ratings, types
+- Full detail view: photos, hours, reviews, amenities, social links
+- **Click any photo to copy its direct URL** (ready for `<img src="">`)
+- Copy phone, Place ID, coordinates with one click
+- Export individual business JSON
+
+---
+
+## 📁 File structure
+
+```
+geo-grid-places-search/
+├── main.ts              ← Step 1: grid scraper → CSV
+├── enrich.ts            ← Step 2: CSV → enriched JSON
+├── dashboard.html       ← Step 3: visual data browser
+├── tsconfig.json
+├── package.json
+├── .gitignore
+└── README.md
 ```
 
 ---
 
-## 🧪 Test Mode (Recommended)
+## ⚠️ API cost estimate
 
-Limit grid points to avoid heavy API usage.
+| Operation | Cost |
+|-----------|------|
+| `main.ts` Nearby Search | ~$32 / 1,000 calls |
+| `enrich.ts` Place Details | ~$17 / 1,000 calls |
+| `enrich.ts` Photo URLs | ~$7 / 1,000 calls |
 
-### Test with 3 grid points
-
-```bash
-npx ts-node main.ts "Mumbai" --test=3
-```
-
-### Test + custom types
-
-```bash
-npx ts-node main.ts "Mumbai" --types=restaurant,cafe --test=3
-```
-
----
-
-## 📄 Output
-
-A CSV file is generated in the project root:
-
-```
-places_Mumbai.csv
-```
-
-### CSV Columns
-
-- id
-- name
-- rating
-- userRatingCount
-- websiteUri
-- formattedAddress
-- latitude
-- longitude
-
----
-
-## 🧠 How it works
-
-1. Geocodes the city to get map bounds
-2. Creates a grid (~3 km spacing)
-3. Runs Nearby Search for each grid point
-4. Merges and deduplicates results
-5. Exports CSV
-
-This avoids the coverage limits of single-radius searches.
-
----
-
-## ⚠️ Cost & Quota Notes
-
-API usage grows with:
-
-```
-Grid Points × Searches
-```
-
-Always test with `--test` first.
+For 79 businesses: **~$10–15 total** for enrichment.  
+Always test with `--test` / `--limit` first.
 
 ---
 
