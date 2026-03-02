@@ -3,28 +3,50 @@
 /**
  * enrich.ts
  *
- * Step 2 of the pipeline: takes a CSV produced by main.ts, filters businesses
- * with no website / enough reviews / high enough rating, then fetches full
- * Google Places (New) details for each one and writes a rich JSON file.
+ * Step 2 of the pipeline: takes a CSV produced by main.ts, filters businesses,
+ * then fetches full Google Places (New) details for each one and writes a rich
+ * JSON file + optionally an enriched CSV for cold outreach.
  *
  * Usage:
  *   npx ts-node enrich.ts places_Austin.csv [options]
+ *   npx ts-node enrich.ts Austin             (auto-resolves exports/places_Austin.csv)
  *
  * Options:
- *   --min-reviews=60       Minimum review count  (default: 60)
- *   --min-rating=3.7       Minimum rating        (default: 3.7)
- *   --limit=10             Cap results (for testing)
- *   --output=out.json      Output filename        (default: enriched_<city>.json)
- *   --photos=8             Max photos per place   (default: 8)
+ *   --min-reviews=60        Minimum review count  (default: 60)
+ *   --min-rating=3.7        Minimum rating        (default: 3.7)
+ *   --website=none          Website filter: none | yes | any  (default: none)
+ *   --limit=10              Cap results (for testing)
+ *   --output=out.json       Output filename        (default: exports/enriched_<city>.json)
+ *   --photos=8              Max photos per place   (default: 8)
+ *   --place-ids=id1,id2     Only enrich specific place IDs (comma-separated)
+ *   --resolve-photos        Resolve photos to direct CDN URLs (no API key needed)
+ *   --scrape-website        Fetch each business website to extract emails & social links
+ *   --csv                   Also export an enriched CSV alongside the JSON
  */
 
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import * as path from "path";
 
-const API_KEY = process.env.GOOGLE_API_KEY as string;
-if (!API_KEY) throw new Error("Missing GOOGLE_API_KEY");
+/* ─── Load .env automatically (no dotenv package needed) ─────────────────────── */
+function loadDotEnv() {
+  try {
+    const lines = readFileSync(".env", "utf8").split("\n");
+    for (const line of lines) {
+      const m = line.match(/^\s*([^#=][^=]*?)\s*=\s*(.*)\s*$/);
+      if (!m) continue;
+      let val = m[2].trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
+        val = val.slice(1, -1);
+      if (!process.env[m[1].trim()]) process.env[m[1].trim()] = val;
+    }
+  } catch { /* .env not present — rely on shell env */ }
+}
+loadDotEnv();
 
-/* ─── CLI args ──────────────────────────────────────────────────────────────── */
+const API_KEY = process.env.GOOGLE_API_KEY as string;
+if (!API_KEY) throw new Error("Missing GOOGLE_API_KEY — add it to .env or export it in your shell");
+
+/* ─── CLI args ───────────────────────────────────────────────────────────────── */
 
 const rawArgs = process.argv.slice(2);
 
@@ -33,24 +55,56 @@ const getFlag = (flag: string): string | undefined => {
   return match ? match.split("=").slice(1).join("=") : undefined;
 };
 
-const CSV_PATH = rawArgs.find(a => !a.startsWith("--")) ?? "";
-if (!CSV_PATH) {
+const hasFlag = (flag: string): boolean => rawArgs.includes(`--${flag}`);
+
+const rawCsvArg = rawArgs.find(a => !a.startsWith("--")) ?? "";
+if (!rawCsvArg) {
   console.error(
-    "Usage: npx ts-node enrich.ts <places_City.csv> [--min-reviews=60] [--min-rating=3.7] [--limit=N] [--output=file.json] [--photos=8]"
+    "Usage: npx ts-node enrich.ts <places_City.csv|CityName> [options]\n" +
+    "  --min-reviews=60  --min-rating=3.7  --website=none|yes|any\n" +
+    "  --limit=N  --output=file.json  --photos=8\n" +
+    "  --place-ids=id1,id2   (target specific places)\n" +
+    "  --resolve-photos      (get direct CDN image URLs)\n" +
+    "  --scrape-website      (extract emails & social from websites)\n" +
+    "  --csv                 (also write enriched CSV)"
   );
   process.exit(1);
 }
 
-const MIN_REVIEWS = parseFloat(getFlag("min-reviews") ?? "60");
-const MIN_RATING  = parseFloat(getFlag("min-rating")  ?? "3.7");
-const LIMIT       = parseInt(getFlag("limit")          ?? "9999");
-const MAX_PHOTOS  = parseInt(getFlag("photos")         ?? "8");
+function resolveCsvPath(arg: string): string {
+  if (existsSync(arg)) return arg;
+  const inExports = path.join("exports", arg);
+  if (existsSync(inExports)) return inExports;
+  const fromCity = path.join("exports", `places_${arg}.csv`);
+  if (existsSync(fromCity)) return fromCity;
+  return arg;
+}
 
-// Derive default output name from the CSV filename  e.g. places_Austin.csv → enriched_Austin.json
-const csvBase = path.basename(CSV_PATH, ".csv").replace(/^places_/, "");
-const OUTPUT  = getFlag("output") ?? `enriched_${csvBase}.json`;
+const CSV_PATH        = resolveCsvPath(rawCsvArg);
+const MIN_REVIEWS     = parseFloat(getFlag("min-reviews")  ?? "60");
+const MIN_RATING      = parseFloat(getFlag("min-rating")   ?? "3.7");
+const WEBSITE_FILTER  = (getFlag("website") ?? "none") as "none" | "yes" | "any";
+const LIMIT           = parseInt(getFlag("limit")          ?? "9999");
+const MAX_PHOTOS      = parseInt(getFlag("photos")         ?? "8");
+const RESOLVE_PHOTOS  = hasFlag("resolve-photos");
+const SCRAPE_WEBSITE  = hasFlag("scrape-website");
+const EXPORT_CSV      = hasFlag("csv");
+const PLACE_IDS_FILTER = (getFlag("place-ids") ?? "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-/* ─── Types ─────────────────────────────────────────────────────────────────── */
+const csvBase  = path.basename(CSV_PATH, ".csv").replace(/^places_/, "");
+mkdirSync(path.join("exports", "data"), { recursive: true });
+const OUTPUT     = getFlag("output") ?? path.join("exports", "data", `enriched_${csvBase}.json`);
+const CSV_OUTPUT = path.join("exports", "data", `enriched_${csvBase}.csv`);
+
+// Write dashboard-config.js so the dashboard can use the same API key without typing it
+writeFileSync(
+  "dashboard-config.js",
+  `/* Auto-generated by enrich.ts — do not commit (already in .gitignore) */\nwindow.GOOGLE_API_KEY = ${JSON.stringify(API_KEY)};\n`,
+  "utf8"
+);
+
+/* ─── Types ──────────────────────────────────────────────────────────────────── */
 
 interface CsvRow {
   id: string;
@@ -65,8 +119,8 @@ interface CsvRow {
 
 interface PhotoInfo {
   name: string;
-  url: string;
-  thumbUrl: string;
+  url: string;       // Direct CDN URL (no API key) when --resolve-photos; else API-key URL
+  thumbUrl: string;  // ~400px version
   authorName: string;
   authorUri: string;
 }
@@ -98,6 +152,13 @@ interface AmenitiesInfo {
   servesBreakfast?: boolean;
   servesLunch?: boolean;
   servesDinner?: boolean;
+}
+
+interface ContactInfo {
+  emails: string[];
+  instagramUrl: string;
+  facebookUrl: string;
+  twitterUrl: string;
 }
 
 interface SocialInfo {
@@ -136,10 +197,11 @@ export interface EnrichedPlace {
   reviewQuotes: { text: string; author: string; rating: number }[];
   amenities: AmenitiesInfo;
   social: SocialInfo;
+  contact: ContactInfo;
   gatheredAt: string;
 }
 
-/* ─── Helpers ───────────────────────────────────────────────────────────────── */
+/* ─── Helpers ────────────────────────────────────────────────────────────────── */
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -148,7 +210,7 @@ function parseCSV(filePath: string): CsvRow[] {
   const lines = content.trim().split("\n");
   const headers = lines[0].split(",").map(h => h.replace(/"/g, "").trim());
 
-  return lines.slice(1).map(line => {
+  return lines.slice(1).filter(l => l.trim()).map(line => {
     const values: string[] = [];
     let current = "";
     let inQuotes = false;
@@ -168,7 +230,6 @@ function parseCSV(filePath: string): CsvRow[] {
 
 /* ─── Places API ─────────────────────────────────────────────────────────────── */
 
-// All fields we want from the Places (New) Details endpoint
 const FIELD_MASK = [
   "id", "displayName", "formattedAddress", "shortFormattedAddress",
   "location", "rating", "userRatingCount", "websiteUri",
@@ -181,7 +242,7 @@ const FIELD_MASK = [
   "outdoorSeating", "liveMusic",
   "servesBeer", "servesWine",
   "servesBreakfast", "servesLunch", "servesDinner",
-  "wheelchairAccessibleEntrance",
+  "accessibilityOptions",
 ].join(",");
 
 async function fetchPlaceDetails(placeId: string): Promise<Record<string, unknown>> {
@@ -196,39 +257,126 @@ async function fetchPlaceDetails(placeId: string): Promise<Record<string, unknow
   return json;
 }
 
+/* ─── Photo CDN URL resolution ───────────────────────────────────────────────── */
+
+/**
+ * Resolves a Places photo resource to a direct lh3.googleusercontent.com CDN URL
+ * that works without an API key — useful for spreadsheets, outreach tools, etc.
+ */
+async function resolvePhotoCdnUrl(photoName: string): Promise<{ url: string; thumbUrl: string }> {
+  try {
+    const endpoint = `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=1200&skipHttpRedirect=true&key=${API_KEY}`;
+    const res = await fetch(endpoint);
+    const json = await res.json() as { photoUri?: string };
+    const cdnUrl = json.photoUri ?? "";
+
+    // lh3.googleusercontent.com URLs support a size suffix like =w400-h400-k-no
+    const thumbUrl = cdnUrl
+      ? cdnUrl.replace(/=w\d+(-h\d+)?(-[a-z-]+)*$/, "=w400-h400-k-no")
+      : "";
+
+    return { url: cdnUrl, thumbUrl: thumbUrl || cdnUrl };
+  } catch {
+    return { url: "", thumbUrl: "" };
+  }
+}
+
+/* ─── Website contact extraction ─────────────────────────────────────────────── */
+
+const IGNORED_EMAIL_DOMAINS = [
+  "example.com", "sentry.io", "wixpress.com", "squarespace.com",
+  "wordpress.com", "googleapis.com", "schema.org", "w3.org",
+];
+
+async function scrapeWebsiteContact(websiteUrl: string): Promise<ContactInfo> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    const res = await fetch(websiteUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; BusinessEnricher/1.0)" },
+    });
+    clearTimeout(timer);
+    const html = await res.text();
+
+    // Extract emails
+    const emailMatches = html.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g) ?? [];
+    const emails = [...new Set(emailMatches)]
+      .filter(e =>
+        !IGNORED_EMAIL_DOMAINS.some(d => e.includes(d)) &&
+        e.length < 60 &&
+        !e.startsWith("//")
+      )
+      .slice(0, 3);
+
+    // Extract social profile URLs — match full URL, strip trailing query strings
+    const igMatch  = html.match(/https?:\/\/(?:www\.)?instagram\.com\/([\w.]+)\/?(?:\?[^\s"'<]*)?/);
+    const fbMatch  = html.match(/https?:\/\/(?:www\.)?facebook\.com\/([\w.-]+)\/?(?:\?[^\s"'<]*)?/);
+    const twMatch  = html.match(/https?:\/\/(?:www\.)?(?:twitter|x)\.com\/([\w]+)\/?(?:\?[^\s"'<]*)?/);
+
+    const cleanUrl = (m: RegExpMatchArray | null) =>
+      m ? m[0].split("?")[0].replace(/\/$/, "") + "/" : "";
+
+    return {
+      emails,
+      instagramUrl: cleanUrl(igMatch),
+      facebookUrl:  cleanUrl(fbMatch),
+      twitterUrl:   cleanUrl(twMatch),
+    };
+  } catch {
+    return { emails: [], instagramUrl: "", facebookUrl: "", twitterUrl: "" };
+  }
+}
+
 /* ─── Data builders ──────────────────────────────────────────────────────────── */
 
-function buildPhotos(photos: unknown[], maxPhotos: number): PhotoInfo[] {
+async function buildPhotos(photos: unknown[], maxPhotos: number): Promise<PhotoInfo[]> {
   if (!Array.isArray(photos)) return [];
-  return photos.slice(0, maxPhotos).map(p => {
+  const result: PhotoInfo[] = [];
+
+  for (const p of photos.slice(0, maxPhotos)) {
     const photo = p as Record<string, unknown>;
-    const name = photo["name"] as string;
+    const name  = photo["name"] as string;
     const attrs = (photo["authorAttributions"] as Record<string, string>[] | undefined) ?? [];
-    return {
+
+    let url      = `https://places.googleapis.com/v1/${name}/media?maxWidthPx=1200&key=${API_KEY}`;
+    let thumbUrl = `https://places.googleapis.com/v1/${name}/media?maxWidthPx=400&key=${API_KEY}`;
+
+    if (RESOLVE_PHOTOS) {
+      const cdn = await resolvePhotoCdnUrl(name);
+      if (cdn.url) {
+        url      = cdn.url;
+        thumbUrl = cdn.thumbUrl || cdn.url;
+      }
+      await sleep(100); // Stay within rate limits
+    }
+
+    result.push({
       name,
-      url:      `https://places.googleapis.com/v1/${name}/media?maxWidthPx=1200&key=${API_KEY}`,
-      thumbUrl: `https://places.googleapis.com/v1/${name}/media?maxWidthPx=400&key=${API_KEY}`,
+      url,
+      thumbUrl,
       authorName: attrs[0]?.["displayName"] ?? "",
       authorUri:  attrs[0]?.["uri"] ?? "",
-    };
-  });
+    });
+  }
+  return result;
 }
 
 function buildReviews(reviews: unknown[]): ReviewInfo[] {
   if (!Array.isArray(reviews)) return [];
   return reviews
     .map(r => {
-      const rev = r as Record<string, unknown>;
-      const attr = rev["authorAttribution"] as Record<string, string> | undefined;
+      const rev     = r as Record<string, unknown>;
+      const attr    = rev["authorAttribution"] as Record<string, string> | undefined;
       const textObj = rev["text"] as Record<string, string> | undefined;
-      const relTime = rev["relativePublishTimeDescription"] as string | undefined;
       return {
-        author:      attr?.["displayName"] ?? "Anonymous",
-        authorPhoto: attr?.["photoUri"] ?? "",
-        rating:      (rev["rating"] as number) ?? 0,
-        text:        textObj?.["text"] ?? "",
-        publishTime: (rev["publishTime"] as string) ?? "",
-        relativeTime: relTime ?? "",
+        author:       attr?.["displayName"] ?? "Anonymous",
+        authorPhoto:  attr?.["photoUri"] ?? "",
+        rating:       (rev["rating"] as number) ?? 0,
+        text:         textObj?.["text"] ?? "",
+        publishTime:  (rev["publishTime"] as string) ?? "",
+        relativeTime: (rev["relativePublishTimeDescription"] as string) ?? "",
       };
     })
     .filter(r => r.text.length > 20);
@@ -246,73 +394,157 @@ function buildHours(openingHours: unknown): HoursInfo | null {
 function buildSocial(name: string, placeId: string, mapsUri: string, shortAddress: string): SocialInfo {
   const slug = name.toLowerCase().replace(/[^a-z0-9]/g, "");
   return {
-    googleMapsUri:   mapsUri || `https://maps.google.com/?place_id=${placeId}`,
-    yelpSearch:      `https://www.yelp.com/search?find_desc=${encodeURIComponent(name)}&find_loc=${encodeURIComponent(shortAddress)}`,
-    instagramGuess:  `https://www.instagram.com/${slug}/`,
-    facebookGuess:   `https://www.facebook.com/${slug}/`,
+    googleMapsUri:  mapsUri || `https://maps.google.com/?place_id=${placeId}`,
+    yelpSearch:     `https://www.yelp.com/search?find_desc=${encodeURIComponent(name)}&find_loc=${encodeURIComponent(shortAddress)}`,
+    instagramGuess: `https://www.instagram.com/${slug}/`,
+    facebookGuess:  `https://www.facebook.com/${slug}/`,
   };
 }
 
-function enrich(row: CsvRow, detail: Record<string, unknown>): EnrichedPlace {
-  const name       = (detail["displayName"] as Record<string, string> | undefined)?.["text"] ?? row.name;
-  const mapsUri    = (detail["googleMapsUri"] as string) ?? "";
-  const shortAddr  = (detail["shortFormattedAddress"] as string) ?? "";
-  const photos     = buildPhotos((detail["photos"] as unknown[]) ?? [], MAX_PHOTOS);
-  const reviews    = buildReviews((detail["reviews"] as unknown[]) ?? []);
-  const hours      = buildHours(detail["regularOpeningHours"]);
+async function enrich(row: CsvRow, detail: Record<string, unknown>): Promise<EnrichedPlace> {
+  const name      = (detail["displayName"] as Record<string, string> | undefined)?.["text"] ?? row.name;
+  const mapsUri   = (detail["googleMapsUri"] as string) ?? "";
+  const shortAddr = (detail["shortFormattedAddress"] as string) ?? "";
+  const website   = (detail["websiteUri"] as string) ?? "";
+
+  const photos  = await buildPhotos((detail["photos"]  as unknown[]) ?? [], MAX_PHOTOS);
+  const reviews = buildReviews((detail["reviews"] as unknown[]) ?? []);
+  const hours   = buildHours(detail["regularOpeningHours"]);
 
   const bestReview = [...reviews]
     .filter(r => r.rating >= 4)
     .sort((a, b) => b.text.length - a.text.length)[0];
 
+  // Website scraping for contact data
+  let contact: ContactInfo = { emails: [], instagramUrl: "", facebookUrl: "", twitterUrl: "" };
+  if (SCRAPE_WEBSITE && website) {
+    process.stdout.write(" → scraping website...");
+    contact = await scrapeWebsiteContact(website);
+    const found = [
+      contact.emails.length > 0     ? `${contact.emails.length} email(s)` : "",
+      contact.instagramUrl           ? "IG"  : "",
+      contact.facebookUrl            ? "FB"  : "",
+      contact.twitterUrl             ? "TW"  : "",
+    ].filter(Boolean);
+    process.stdout.write(found.length ? ` [${found.join(", ")}]` : " [nothing found]");
+  }
+
   return {
-    placeId:          row.id,
-    googleMapsUri:    mapsUri,
+    placeId:           row.id,
+    googleMapsUri:     mapsUri,
     name,
-    address:          (detail["formattedAddress"] as string) ?? row.formattedAddress,
-    shortAddress:     shortAddr,
-    phone:            (detail["nationalPhoneNumber"] as string) ?? "",
-    phoneIntl:        (detail["internationalPhoneNumber"] as string) ?? "",
-    website:          (detail["websiteUri"] as string) ?? "",
-    types:            (detail["types"] as string[]) ?? [],
-    primaryType:      (detail["primaryType"] as string) ?? "",
-    priceLevel:       (detail["priceLevel"] as string) ?? "",
-    businessStatus:   (detail["businessStatus"] as string) ?? "OPERATIONAL",
-    rating:           (detail["rating"] as number) ?? parseFloat(row.rating),
-    reviewCount:      (detail["userRatingCount"] as number) ?? parseInt(row.userRatingCount),
-    latitude:         ((detail["location"] as Record<string, number> | undefined)?.["latitude"]) ?? parseFloat(row.latitude),
-    longitude:        ((detail["location"] as Record<string, number> | undefined)?.["longitude"]) ?? parseFloat(row.longitude),
-    editorialSummary: ((detail["editorialSummary"] as Record<string, string> | undefined)?.["text"]) ?? "",
-    generativeSummary:((detail["generativeSummary"] as Record<string, Record<string, string>> | undefined)?.["overview"]?.["text"]) ?? "",
+    address:           (detail["formattedAddress"] as string) ?? row.formattedAddress,
+    shortAddress:      shortAddr,
+    phone:             (detail["nationalPhoneNumber"] as string) ?? "",
+    phoneIntl:         (detail["internationalPhoneNumber"] as string) ?? "",
+    website,
+    types:             (detail["types"] as string[]) ?? [],
+    primaryType:       (detail["primaryType"] as string) ?? "",
+    priceLevel:        (detail["priceLevel"] as string) ?? "",
+    businessStatus:    (detail["businessStatus"] as string) ?? "OPERATIONAL",
+    rating:            (detail["rating"] as number) ?? parseFloat(row.rating),
+    reviewCount:       (detail["userRatingCount"] as number) ?? parseInt(row.userRatingCount),
+    latitude:          ((detail["location"] as Record<string, number> | undefined)?.["latitude"])  ?? parseFloat(row.latitude),
+    longitude:         ((detail["location"] as Record<string, number> | undefined)?.["longitude"]) ?? parseFloat(row.longitude),
+    editorialSummary:  ((detail["editorialSummary"]  as Record<string, string> | undefined)?.["text"]) ?? "",
+    generativeSummary: ((detail["generativeSummary"] as Record<string, Record<string, string>> | undefined)?.["overview"]?.["text"]) ?? "",
     hours,
-    hoursDisplay:     hours?.weekdayDescriptions ?? [],
+    hoursDisplay:      hours?.weekdayDescriptions ?? [],
     photos,
-    heroPhotoUrl:     photos[0]?.url ?? "",
-    heroPhotoThumb:   photos[0]?.thumbUrl ?? "",
+    heroPhotoUrl:      photos[0]?.url ?? "",
+    heroPhotoThumb:    photos[0]?.thumbUrl ?? "",
     reviews,
     bestReview,
-    reviewQuotes:     reviews.slice(0, 3).map(r => ({
+    reviewQuotes:      reviews.slice(0, 3).map(r => ({
       text:   r.text.slice(0, 200),
       author: r.author,
       rating: r.rating,
     })),
     amenities: {
-      dineIn:               detail["dineIn"] as boolean | undefined,
-      takeout:              detail["takeout"] as boolean | undefined,
-      delivery:             detail["delivery"] as boolean | undefined,
-      reservable:           detail["reservable"] as boolean | undefined,
-      outdoorSeating:       detail["outdoorSeating"] as boolean | undefined,
-      liveMusic:            detail["liveMusic"] as boolean | undefined,
-      wheelchairAccessible: detail["wheelchairAccessibleEntrance"] as boolean | undefined,
-      servesBeer:           detail["servesBeer"] as boolean | undefined,
-      servesWine:           detail["servesWine"] as boolean | undefined,
-      servesBreakfast:      detail["servesBreakfast"] as boolean | undefined,
-      servesLunch:          detail["servesLunch"] as boolean | undefined,
-      servesDinner:         detail["servesDinner"] as boolean | undefined,
+      dineIn:               detail["dineIn"]                    as boolean | undefined,
+      takeout:              detail["takeout"]                   as boolean | undefined,
+      delivery:             detail["delivery"]                  as boolean | undefined,
+      reservable:           detail["reservable"]                as boolean | undefined,
+      outdoorSeating:       detail["outdoorSeating"]            as boolean | undefined,
+      liveMusic:            detail["liveMusic"]                 as boolean | undefined,
+      wheelchairAccessible: ((detail["accessibilityOptions"] as Record<string, boolean> | undefined)?.["wheelchairAccessibleEntrance"]) as boolean | undefined,
+      servesBeer:           detail["servesBeer"]                as boolean | undefined,
+      servesWine:           detail["servesWine"]                as boolean | undefined,
+      servesBreakfast:      detail["servesBreakfast"]           as boolean | undefined,
+      servesLunch:          detail["servesLunch"]               as boolean | undefined,
+      servesDinner:         detail["servesDinner"]              as boolean | undefined,
     },
-    social: buildSocial(name, row.id, mapsUri, shortAddr),
+    social:   buildSocial(name, row.id, mapsUri, shortAddr),
+    contact,
     gatheredAt: new Date().toISOString(),
   };
+}
+
+/* ─── CSV Export ─────────────────────────────────────────────────────────────── */
+
+function toEnrichedCsv(places: EnrichedPlace[]): string {
+  const esc = (v: string | number | boolean | undefined | null) =>
+    `"${String(v ?? "").replace(/"/g, '""')}"`;
+
+  const headers = [
+    // Identity
+    "place_id", "name",
+    // Contact (cold-outreach essentials first)
+    "phone", "email_1", "email_2", "email_3",
+    // Online presence
+    "website", "instagram", "facebook", "twitter",
+    // Ratings
+    "rating", "review_count", "price_level",
+    // Location
+    "address", "latitude", "longitude", "google_maps_uri",
+    // Hours (Mon–Sun)
+    "hours_mon", "hours_tue", "hours_wed", "hours_thu", "hours_fri", "hours_sat", "hours_sun",
+    // Photos — 10 direct CDN URLs
+    "photo_1", "photo_2", "photo_3", "photo_4", "photo_5",
+    "photo_6", "photo_7", "photo_8", "photo_9", "photo_10",
+    // Reviews — up to 5 (author, stars, text)
+    "review_1_author", "review_1_stars", "review_1_text",
+    "review_2_author", "review_2_stars", "review_2_text",
+    "review_3_author", "review_3_stars", "review_3_text",
+    "review_4_author", "review_4_stars", "review_4_text",
+    "review_5_author", "review_5_stars", "review_5_text",
+    // Meta
+    "primary_type", "business_status", "editorial_summary", "gathered_at",
+  ];
+
+  const rows = places.map(b => {
+    const h  = b.hoursDisplay ?? [];
+    const em = b.contact?.emails ?? [];
+    const ig = b.contact?.instagramUrl || b.social?.instagramGuess || "";
+    const fb = b.contact?.facebookUrl  || b.social?.facebookGuess  || "";
+    const tw = b.contact?.twitterUrl   || "";
+    const rv = b.reviews ?? [];
+
+    return [
+      esc(b.placeId), esc(b.name),
+      esc(b.phone), esc(em[0]), esc(em[1]), esc(em[2]),
+      esc(b.website), esc(ig), esc(fb), esc(tw),
+      esc(b.rating), esc(b.reviewCount), esc(b.priceLevel),
+      esc(b.address), esc(b.latitude), esc(b.longitude), esc(b.googleMapsUri),
+      esc(h[0]), esc(h[1]), esc(h[2]), esc(h[3]), esc(h[4]), esc(h[5]), esc(h[6]),
+      // 10 photo URLs
+      esc(b.photos[0]?.url), esc(b.photos[1]?.url), esc(b.photos[2]?.url),
+      esc(b.photos[3]?.url), esc(b.photos[4]?.url), esc(b.photos[5]?.url),
+      esc(b.photos[6]?.url), esc(b.photos[7]?.url), esc(b.photos[8]?.url),
+      esc(b.photos[9]?.url),
+      // 5 reviews
+      esc(rv[0]?.author), esc(rv[0]?.rating), esc(rv[0]?.text),
+      esc(rv[1]?.author), esc(rv[1]?.rating), esc(rv[1]?.text),
+      esc(rv[2]?.author), esc(rv[2]?.rating), esc(rv[2]?.text),
+      esc(rv[3]?.author), esc(rv[3]?.rating), esc(rv[3]?.text),
+      esc(rv[4]?.author), esc(rv[4]?.rating), esc(rv[4]?.text),
+      // Meta
+      esc(b.primaryType), esc(b.businessStatus),
+      esc(b.editorialSummary || b.generativeSummary), esc(b.gatheredAt),
+    ].join(",");
+  });
+
+  return [headers.join(","), ...rows].join("\n");
 }
 
 /* ─── Main ───────────────────────────────────────────────────────────────────── */
@@ -322,16 +554,33 @@ async function run() {
   const rows = parseCSV(CSV_PATH);
   console.log(`    Total rows in CSV: ${rows.length}`);
 
-  // Apply filters
+  if (RESOLVE_PHOTOS) console.log("📸  Photo CDN resolution: ON  (1 extra API call per photo)");
+  if (SCRAPE_WEBSITE) console.log("🕸️  Website scraping: ON  (extracts emails & social links)");
+  if (PLACE_IDS_FILTER.length > 0) console.log(`🎯  Targeting ${PLACE_IDS_FILTER.length} specific place ID(s)`);
+
+  const websiteLabel =
+    WEBSITE_FILTER === "none" ? "no website" :
+    WEBSITE_FILTER === "yes"  ? "has website" : "any website";
+
   const targets = rows
-    .filter(r =>
-      (!r.websiteUri || r.websiteUri.trim() === "") &&
-      parseFloat(r.userRatingCount || "0") > MIN_REVIEWS &&
-      parseFloat(r.rating || "0") > MIN_RATING
-    )
+    .filter(r => {
+      if (PLACE_IDS_FILTER.length > 0 && !PLACE_IDS_FILTER.includes(r.id)) return false;
+      const hasWebsite = r.websiteUri && r.websiteUri.trim() !== "";
+      const websiteOk =
+        WEBSITE_FILTER === "any"  ? true :
+        WEBSITE_FILTER === "yes"  ? hasWebsite :
+        /* none */                  !hasWebsite;
+      return websiteOk &&
+        parseFloat(r.userRatingCount || "0") > MIN_REVIEWS &&
+        parseFloat(r.rating || "0") > MIN_RATING;
+    })
     .slice(0, LIMIT);
 
-  console.log(`🎯  Matching (no site, >${MIN_REVIEWS} reviews, >${MIN_RATING}★): ${targets.length}`);
+  if (PLACE_IDS_FILTER.length > 0) {
+    console.log(`    Found ${targets.length} of ${PLACE_IDS_FILTER.length} requested IDs in CSV`);
+  } else {
+    console.log(`🎯  Matching (${websiteLabel}, >${MIN_REVIEWS} reviews, >${MIN_RATING}★): ${targets.length}`);
+  }
   console.log("");
 
   const results: EnrichedPlace[] = [];
@@ -342,52 +591,66 @@ async function run() {
     const tag = `[${i + 1}/${targets.length}]`;
 
     try {
-      process.stdout.write(`${tag} ${row.name}... `);
-      const detail = await fetchPlaceDetails(row.id);
-      const enriched = enrich(row, detail);
+      process.stdout.write(`${tag} ${row.name}...`);
+      const detail   = await fetchPlaceDetails(row.id);
+      const enriched = await enrich(row, detail);
       results.push(enriched);
-      console.log(`✅  ${enriched.rating}★  ${enriched.reviewCount} reviews  ${enriched.photos.length} photos`);
+      console.log(`\n    ✅  ${enriched.rating}★  ${enriched.reviewCount} reviews  ` +
+        `${enriched.photos.length} photos  ${enriched.phone || "no phone"}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.log(`❌  ${msg}`);
+      console.log(`\n    ❌  ${msg}`);
       errors.push({ placeId: row.id, name: row.name, error: msg });
     }
 
-    // Stay well within the 10 req/s limit
     if (i < targets.length - 1) await sleep(150);
   }
 
-  // Output
+  // Write JSON output
   const output = {
     generatedAt:     new Date().toISOString(),
     sourceFile:      CSV_PATH,
-    filters:         { minReviews: MIN_REVIEWS, minRating: MIN_RATING },
+    filters:         { minReviews: MIN_REVIEWS, minRating: MIN_RATING, website: WEBSITE_FILTER },
+    flags:           { resolvePhotos: RESOLVE_PHOTOS, scrapeWebsite: SCRAPE_WEBSITE },
     totalBusinesses: results.length,
     errorCount:      errors.length,
     businesses:      results,
     errorLog:        errors,
   };
-
   writeFileSync(OUTPUT, JSON.stringify(output, null, 2), "utf8");
+  console.log(`\n✅  Done — ${results.length} enriched, ${errors.length} errors`);
+  console.log(`📁  JSON: ${OUTPUT}`);
 
-  console.log("");
-  console.log(`✅  Done — ${results.length} enriched, ${errors.length} errors`);
-  console.log(`📁  Output: ${OUTPUT}`);
+  // Write CSV output
+  if (EXPORT_CSV || results.length > 0) {
+    writeFileSync(CSV_OUTPUT, toEnrichedCsv(results), "utf8");
+    console.log(`📊  CSV:  ${CSV_OUTPUT}`);
+  }
 
   // Coverage summary
   const withPhotos  = results.filter(b => b.photos.length  > 0).length;
   const withHours   = results.filter(b => b.hours          !== null).length;
   const withReviews = results.filter(b => b.reviews.length > 0).length;
   const withPhone   = results.filter(b => b.phone          !== "").length;
+  const withEmail   = results.filter(b => (b.contact?.emails.length ?? 0) > 0).length;
+  const withIG      = results.filter(b => !!b.contact?.instagramUrl).length;
+  const withFB      = results.filter(b => !!b.contact?.facebookUrl).length;
 
-  console.log("");
-  console.log("📊  Data coverage:");
-  console.log(`    Photos:  ${withPhotos}/${results.length}`);
-  console.log(`    Hours:   ${withHours}/${results.length}`);
-  console.log(`    Reviews: ${withReviews}/${results.length}`);
-  console.log(`    Phone:   ${withPhone}/${results.length}`);
-  console.log("");
-  console.log("💡  Next: open dashboard.html in your browser and drop in the JSON file");
+  console.log("\n📊  Data coverage:");
+  console.log(`    Photos:    ${withPhotos}/${results.length}`);
+  console.log(`    Hours:     ${withHours}/${results.length}`);
+  console.log(`    Reviews:   ${withReviews}/${results.length}`);
+  console.log(`    Phone:     ${withPhone}/${results.length}`);
+  if (SCRAPE_WEBSITE) {
+    console.log(`    Email:     ${withEmail}/${results.length}`);
+    console.log(`    Instagram: ${withIG}/${results.length} (confirmed)`);
+    console.log(`    Facebook:  ${withFB}/${results.length} (confirmed)`);
+  }
+
+  console.log("\n💡  Next steps:");
+  if (!RESOLVE_PHOTOS) console.log("    Add --resolve-photos to get direct CDN image URLs (no API key needed)");
+  if (!SCRAPE_WEBSITE) console.log("    Add --scrape-website to extract emails & social links from websites");
+  console.log("    Drop the JSON into dashboard.html to browse & export");
 }
 
 run().catch(err => {

@@ -1,3 +1,9 @@
 # Environment files
 .env
 .env.*
+
+# Generated exports
+exports/
+
+# Auto-generated dashboard API key config (written by enrich.ts / main.ts)
+dashboard-config.js
