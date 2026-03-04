@@ -1,0 +1,28 @@
+[
+  {
+    "name": "Austin",
+    "key": "Austin",
+    "csvPath": "exports/cities/places_Austin.csv",
+    "enrichedPaths": [
+      "exports/enriched/Austin_gary_s_grill.csv",
+      "exports/enriched/Austin_la_china_atx_authentic_mexican_food.csv",
+      "exports/enriched/Austin_melting_grill.csv",
+      "exports/enriched/Austin_oui_s_thai.csv",
+      "exports/enriched/Austin_taqueria_monarca_2.csv",
+      "exports/enriched/Austin_tony_s_south_austin_pizza.csv",
+      "exports/enriched/Austin_wake_up_mykie.csv"
+    ]
+  },
+  {
+    "name": "New York",
+    "key": "New_York",
+    "csvPath": "exports/cities/places_New_York.csv",
+    "enrichedPaths": []
+  },
+  {
+    "name": "Nashville",
+    "key": "nashville",
+    "csvPath": "exports/cities/places_nashville.csv",
+    "enrichedPaths": []
+  }
+]
