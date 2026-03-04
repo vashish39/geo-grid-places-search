@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install -g vercel)",
+      "Bash(node gen-config.js)",
+      "mcp__Claude_Preview__preview_start"
+    ]
+  }
+}
