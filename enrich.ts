@@ -625,6 +625,9 @@ async function run() {
   if (EXPORT_CSV || results.length > 0) {
     writeFileSync(CSV_OUTPUT, toEnrichedCsv(results), "utf8");
     console.log(`📊  CSV:  ${CSV_OUTPUT}`);
+    if (!RESOLVE_PHOTOS && results.some(b => b.photos.length > 0)) {
+      console.log("⚠️   Photo URLs in this CSV contain your API key — add --resolve-photos to get shareable CDN URLs");
+    }
   }
 
   // Coverage summary

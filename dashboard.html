@@ -1235,7 +1235,11 @@ function initDashboard() {
   const filterRow = document.getElementById('typeFilters');
   filterRow.innerHTML = `<button class="filter-btn active" onclick="setTypeFilter('all', this)">All</button>`;
   types.slice(0, 7).forEach(t => {
-    filterRow.innerHTML += `<button class="filter-btn" onclick="setTypeFilter('${t}', this)">${t}</button>`;
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn';
+    btn.textContent = t;
+    btn.onclick = () => setTypeFilter(t, btn);
+    filterRow.appendChild(btn);
   });
 
   updateSelectionBar();
